@@ -1,0 +1,13 @@
+[
+  {
+    "session_id": "demo-performance-001",
+    "evidence_id": "cpu.sample",
+    "evidence_type": "performance.cpu",
+    "collected_at": "2026-10-16T12:00:00Z",
+    "status": "available",
+    "data": {
+      "utilization_percent": 94
+    },
+    "source": "approved_cpu_collector"
+  }
+]
