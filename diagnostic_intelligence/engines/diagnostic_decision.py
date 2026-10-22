@@ -17,8 +17,15 @@ _PURPOSES: dict[EvidenceType, tuple[str, list[str], str]] = {
         "Volume names and capacity values are system metadata; omit file names and paths.",
     ),
     EvidenceType.DISK_ACTIVITY: (
-        "Check disk utilization and latency during the reported issue.",
-        ["utilization_percent", "average_latency_ms", "observation_window_seconds"],
+        "Measure aggregate disk throughput and average I/O latency during the reported issue.",
+        [
+            "observation_window_seconds",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "read_ops_per_second",
+            "write_ops_per_second",
+            "average_latency_ms",
+        ],
         "Collect aggregate metrics only; do not collect file contents.",
     ),
     EvidenceType.STORAGE_ERRORS: (

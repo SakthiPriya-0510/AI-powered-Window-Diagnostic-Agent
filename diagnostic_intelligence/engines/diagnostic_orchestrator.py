@@ -23,8 +23,14 @@ from diagnostic_intelligence.models.requests import DiagnosticRequest
 class DiagnosticOrchestrator:
     """Coordinate understanding, evidence planning, correlation, and explanation."""
 
-    def __init__(self, ai_agent: object | None = None) -> None:
+    def __init__(
+        self,
+        ai_agent: object | None = None,
+        *,
+        evidence_collector: object | None = None,
+    ) -> None:
         self.ai_agent = ai_agent or OllamaAgent()
+        self.evidence_collector = evidence_collector
         self.understanding_engine = ProblemUnderstandingEngine(self.ai_agent)
         self.decision_engine = DiagnosticDecisionEngine(self.ai_agent)
         self.correlation_engine = RootCauseCorrelationEngine(self.ai_agent)
@@ -65,6 +71,26 @@ class DiagnosticOrchestrator:
                 [], warnings, [], valid_evidence,
                 "Please answer the clarification question before collecting diagnostic evidence.",
             )
+        if self.evidence_collector is not None:
+            try:
+                collected_records = self.evidence_collector.collect_for_plan(plan)
+            except Exception as error:
+                warnings.append(f"Evidence collection failed: {type(error).__name__}.")
+                collected_records = []
+            for index, record in enumerate(collected_records):
+                try:
+                    validated = (
+                        record
+                        if isinstance(record, EvidenceRecord)
+                        else EvidenceRecord.model_validate(record)
+                    )
+                except ValidationError as error:
+                    warnings.append(
+                        f"Collected evidence item {index + 1} was malformed and ignored: "
+                        f"{self._validation_summary(error)}"
+                    )
+                    continue
+                valid_evidence.append(validated)
 
         aligned_evidence = [
             record for record in valid_evidence if record.session_id == session_id
@@ -110,6 +136,10 @@ class DiagnosticOrchestrator:
                 if summary:
                     result.ai_summary = summary
                     result.ai_model = getattr(agent, "model", "ollama")
+                else:
+                    result.warnings.append(
+                        "Optional Ollama summary could not be generated; deterministic analysis remains authoritative."
+                    )
         return result
 
     @staticmethod
@@ -178,5 +208,24 @@ class DiagnosticOrchestrator:
             latest = samples[-1]
             if isinstance(latest, dict) and isinstance(latest.get("utilization_percent"), (int, float)):
                 facts.append(f"utilization_percent={latest['utilization_percent']}")
+        processes = record.data.get("processes")
+        if isinstance(processes, list):
+            summaries = []
+            for process in processes[:3]:
+                if not isinstance(process, dict) or not isinstance(process.get("name"), str):
+                    continue
+                process_facts = [process["name"][:128]]
+                cpu_percent = process.get("cpu_percent")
+                memory_bytes = process.get("memory_bytes")
+                if isinstance(cpu_percent, (int, float)) and not isinstance(cpu_percent, bool):
+                    process_facts.append(f"cpu_percent={cpu_percent:.1f}")
+                if isinstance(memory_bytes, int) and not isinstance(memory_bytes, bool):
+                    process_facts.append(f"memory_bytes={memory_bytes}")
+                summaries.append(" ".join(process_facts))
+            if summaries:
+                facts.append(f"top_processes={'; '.join(summaries)}")
+        incidents = record.data.get("incidents")
+        if isinstance(incidents, list):
+            facts.append(f"incident_count={len(incidents)}")
         suffix = f" ({', '.join(facts)})" if facts else ""
         return f"{record.evidence_type.value}: {record.status.value}{suffix}"

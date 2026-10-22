@@ -142,7 +142,7 @@ class OllamaAgent:
         category: str,
         evidence_summary: list[str],
         root_causes: list[str],
-    ) -> str:
+    ) -> str | None:
         """Generate a concise, safety-constrained summary from a local Ollama model."""
         prompt = (
             "You are a safety-constrained diagnostic assistant. Use only the structured evidence below "
@@ -154,6 +154,4 @@ class OllamaAgent:
             f"Root causes: {json.dumps(root_causes, ensure_ascii=True)}"
         )
         response = self._call_model(prompt)
-        if not response:
-            return "AI summary unavailable; deterministic evidence analysis remains the authoritative result."
-        return response
+        return response or None

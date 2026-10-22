@@ -14,9 +14,11 @@ from tests.helpers import evidence
     ("complaint", "evidence_type", "data", "cause_id"),
     [
         ("My disk space is low.", "storage.capacity", {"free_percent": 4}, "storage.low_free_space"),
+        ("My disk has repeated storage errors.", "storage.errors", {"recurring_error_count": 3}, "storage.recurring_errors"),
         ("My Wi-Fi internet fails.", "network.dns_resolution", {"success": False}, "network.dns_failure"),
         ("My laptop is slow.", "performance.cpu", {"utilization_percent": 96}, "performance.cpu_saturation"),
         ("Windows hangs with system errors.", "windows.system_events", {"recurring_error_count": 4}, "windows_health.recurring_errors"),
+        ("Windows applications crash and hang.", "windows.reliability", {"incidents": [{"type": "Application Error"}]}, "windows_health.reliability_failure"),
         ("My application won't start.", "application.logs", {"error_category": "missing_runtime"}, "application.runtime_incompatibility"),
         ("My device driver is failing.", "driver.device_status", {"problem_code": 10}, "driver.device_error"),
     ],
@@ -44,6 +46,16 @@ def test_collector_nested_capacity_shape_supports_low_space_finding() -> None:
     )
     candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
     assert candidates[0].cause_id == "storage.low_free_space"
+
+
+def test_single_storage_error_does_not_create_recurring_error_finding() -> None:
+    understanding = ProblemUnderstandingEngine().understand("My disk has a storage error.")
+    plan = DiagnosticDecisionEngine().create_plan(understanding, session_id="test-session")
+    record = evidence("storage.errors", {"recurring_error_count": 1, "events": []})
+
+    candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
+
+    assert all(candidate.cause_id != "storage.recurring_errors" for candidate in candidates)
 
 
 def test_cpu_sample_series_supports_finding() -> None:
@@ -83,6 +95,45 @@ def test_normal_metric_does_not_create_cause() -> None:
         understanding, plan, [evidence("performance.cpu", {"utilization_percent": 18})]
     )
     assert all(candidate.cause_id != "performance.cpu_saturation" for candidate in candidates)
+
+
+def test_mixed_adapter_statuses_do_not_report_network_unavailable() -> None:
+    understanding = ProblemUnderstandingEngine().understand("Wi-Fi keeps disconnecting.")
+    plan = DiagnosticDecisionEngine().create_plan(understanding, session_id="test-session")
+    record = evidence(
+        "network.adapter_status",
+        {"adapters": [{"status": "up"}, {"status": "down"}]},
+    )
+
+    candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
+
+    assert all(candidate.cause_id != "network.adapter_unavailable" for candidate in candidates)
+
+
+def test_all_explicitly_down_adapters_support_network_unavailable() -> None:
+    understanding = ProblemUnderstandingEngine().understand("Wi-Fi keeps disconnecting.")
+    plan = DiagnosticDecisionEngine().create_plan(understanding, session_id="test-session")
+    record = evidence(
+        "network.adapter_status",
+        {"adapters": [{"status": "down"}, {"status": "down"}]},
+    )
+
+    candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
+
+    assert candidates[0].cause_id == "network.adapter_unavailable"
+
+
+def test_missing_default_gateway_is_not_reported_as_unreachable() -> None:
+    understanding = ProblemUnderstandingEngine().understand("My network gateway is missing.")
+    plan = DiagnosticDecisionEngine().create_plan(understanding, session_id="test-session")
+    record = evidence(
+        "network.gateway_reachability",
+        {"gateway": None, "reachable": False, "error_category": "no_default_gateway"},
+    )
+
+    candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
+
+    assert all(candidate.cause_id != "network.gateway_unreachable" for candidate in candidates)
 
 
 def test_stale_evidence_is_excluded() -> None:
@@ -131,3 +182,16 @@ def test_untrusted_log_text_does_not_produce_findings() -> None:
     )
     candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
     assert candidates == []
+
+
+def test_reliability_update_event_does_not_create_application_failure() -> None:
+    understanding = ProblemUnderstandingEngine().understand("Windows applications crash and hang.")
+    plan = DiagnosticDecisionEngine().create_plan(understanding, session_id="test-session")
+    record = evidence(
+        "windows.reliability",
+        {"incidents": [{"type": "Windows Update", "application": "Update Client"}]},
+    )
+
+    candidates, _, _ = RootCauseCorrelationEngine().analyze(understanding, plan, [record])
+
+    assert all(candidate.cause_id != "windows_health.reliability_failure" for candidate in candidates)

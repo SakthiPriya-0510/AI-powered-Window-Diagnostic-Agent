@@ -84,8 +84,32 @@ def _has_runtime_error(data: dict[str, Any]) -> bool:
     )
 
 
+def _has_reliability_failure(data: dict[str, Any]) -> bool:
+    incidents = data.get("incidents")
+    if not isinstance(incidents, list):
+        return False
+    return any(
+        isinstance(incident, dict)
+        and isinstance(incident.get("type"), str)
+        and incident["type"].casefold() in {"application error", "application hang"}
+        for incident in incidents
+    )
+
+
 def _eq(value: Any, expected: Any) -> bool:
     return isinstance(value, str) and value.casefold() == expected
+
+
+def _adapter_statuses(data: dict[str, Any]) -> list[str]:
+    adapters = data.get("adapters")
+    if not isinstance(adapters, list):
+        return []
+    return [
+        adapter["status"].casefold()
+        for adapter in adapters
+        if isinstance(adapter, dict)
+        and isinstance(adapter.get("status"), str)
+    ]
 
 
 RULES: tuple[CauseRule, ...] = (
@@ -115,6 +139,14 @@ RULES: tuple[CauseRule, ...] = (
         "Repeat aggregate disk measurements during the reported slowdown.",
     ),
     CauseRule(
+        "storage.recurring_errors", Category.STORAGE, "Recurring storage-related system errors",
+        "Repeated System event metadata from storage providers supports further storage investigation, but does not establish disk failure.",
+        EvidenceType.STORAGE_ERRORS,
+        lambda d: (_number(d, "recurring_error_count") or 0) >= 3,
+        lambda d: _number(d, "recurring_error_count") == 0,
+        "Compare storage event timestamps with the reported symptoms and fresh disk activity before drawing a stronger conclusion.",
+    ),
+    CauseRule(
         "network.dns_failure", Category.NETWORK, "DNS resolution failure",
         "A DNS resolution test explicitly failed; this supports a name-resolution issue, not a general internet diagnosis.",
         EvidenceType.DNS_RESOLUTION,
@@ -127,8 +159,8 @@ RULES: tuple[CauseRule, ...] = (
         "network.gateway_unreachable", Category.NETWORK, "Default gateway unreachable",
         "The collected gateway reachability test reports the default gateway as unreachable.",
         EvidenceType.GATEWAY_REACHABILITY,
-        lambda d: d.get("reachable") is False,
-        lambda d: d.get("reachable") is True,
+        lambda d: isinstance(d.get("gateway"), str) and bool(d["gateway"]) and d.get("reachable") is False,
+        lambda d: isinstance(d.get("gateway"), str) and bool(d["gateway"]) and d.get("reachable") is True,
         "Check adapter status and IP configuration before considering any network change.",
     ),
     CauseRule(
@@ -142,15 +174,15 @@ RULES: tuple[CauseRule, ...] = (
     ),
     CauseRule(
         "network.adapter_unavailable", Category.NETWORK, "Network adapter unavailable",
-        "Collector evidence reports an adapter status other than operational.",
+        "All reported network adapters are explicitly down; this indicates network access may be unavailable but does not identify the underlying cause.",
         EvidenceType.ADAPTER_STATUS,
+        lambda d: bool(_adapter_statuses(d)) and all(
+            status == "down" for status in _adapter_statuses(d)
+        ),
         lambda d: any(
-            isinstance(adapter.get("status"), str)
-            and adapter["status"].casefold() not in {"up", "connected", "ok"}
-            for adapter in d.get("adapters", [])
-            if isinstance(adapter, dict)
-        ) if isinstance(d.get("adapters"), list) else _eq(d.get("status"), "down"),
-        lambda d: _eq(d.get("status"), "up"),
+            status in {"up", "connected", "ok"}
+            for status in _adapter_statuses(d)
+        ),
         "Identify the relevant adapter and check its device status and recent driver events.",
     ),
     CauseRule(
@@ -186,6 +218,15 @@ RULES: tuple[CauseRule, ...] = (
         lambda d: (_number(d, "recurring_error_count") or 0) >= 3,
         lambda d: _number(d, "recurring_error_count") == 0,
         "Compare event timestamps with the user's reported hang times and reliability summary.",
+    ),
+    CauseRule(
+        "windows_health.reliability_failure", Category.WINDOWS_HEALTH,
+        "Application failure or hang recorded",
+        "Windows reliability metadata contains an application error or hang record; this is evidence of an incident, not proof that it caused the reported symptom.",
+        EvidenceType.RELIABILITY_SUMMARY,
+        _has_reliability_failure,
+        lambda d: isinstance(d.get("incidents"), list) and not _has_reliability_failure(d),
+        "Compare the incident timestamp with the reported symptom and collect application-specific evidence before drawing a stronger conclusion.",
     ),
     CauseRule(
         "application.runtime_incompatibility", Category.APPLICATION_COMPATIBILITY,
@@ -312,6 +353,10 @@ class RootCauseCorrelationEngine:
                 continue
             support_ids = [item.evidence_id for item in supporters]
             contradict_ids = [item.evidence_id for item in contradictors]
+            explanation = rule.explanation
+            process_context = self._process_context(rule, usable)
+            if process_context:
+                explanation = f"{explanation} {process_context}"
             score = min(0.92, 0.68 + 0.08 * (len(support_ids) - 1))
             if contradict_ids:
                 score = max(0.25, score - 0.25)
@@ -320,7 +365,7 @@ class RootCauseCorrelationEngine:
                 RootCauseCandidate(
                     cause_id=rule.cause_id,
                     title=rule.title,
-                    explanation=rule.explanation,
+                    explanation=explanation,
                     supporting_evidence_ids=support_ids,
                     contradicting_evidence_ids=contradict_ids,
                     confidence_score=score,
@@ -355,6 +400,45 @@ class RootCauseCorrelationEngine:
             return predicate(data)
         except (TypeError, ValueError, AttributeError):
             return False
+
+    @staticmethod
+    def _process_context(rule: CauseRule, usable: list[EvidenceRecord]) -> str | None:
+        if rule.cause_id not in {
+            "performance.cpu_saturation",
+            "performance.memory_pressure",
+        }:
+            return None
+        process_records = [
+            item for item in usable if item.evidence_type == EvidenceType.PROCESS_SUMMARY
+        ]
+        processes = [
+            process
+            for record in process_records
+            for process in record.data.get("processes", [])
+            if isinstance(process, dict) and isinstance(process.get("name"), str)
+        ]
+        if not processes:
+            return None
+        if rule.cause_id == "performance.cpu_saturation":
+            key = "cpu_percent"
+            label = "highest sampled CPU consumer"
+        else:
+            key = "memory_bytes"
+            label = "largest sampled memory consumer"
+        measured = [
+            process for process in processes
+            if isinstance(process.get(key), (int, float))
+            and not isinstance(process.get(key), bool)
+        ]
+        if not measured:
+            return None
+        top_process = max(measured, key=lambda process: process[key])
+        value = top_process[key]
+        formatted_value = f"{value:.1f}%" if key == "cpu_percent" else f"{int(value)} bytes"
+        return (
+            f"The {label} was '{top_process['name'][:128]}' at {formatted_value}; "
+            "this short sample is contextual evidence, not proof of causation."
+        )
 
     @staticmethod
     def _missing_for(
