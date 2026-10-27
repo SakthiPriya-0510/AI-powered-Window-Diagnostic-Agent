@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+audit_logs/
+node_modules/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
